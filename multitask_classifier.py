@@ -13,8 +13,7 @@ from tqdm import tqdm
 from datasets import SentenceClassificationDataset, SentencePairDataset, \
     load_multitask_data, load_multitask_test_data
 
-from evaluation import model_eval_sst, test_model_multitask
-
+from evaluation import model_eval_sst, test_model_multitask, model_eval_multitask
 
 TQDM_DISABLE=True
 
@@ -52,7 +51,7 @@ class MultitaskBERT(nn.Module):
             elif config.option == 'finetune':
                 param.requires_grad = True
         ### TODO
-        self.dropout = nn.Dropout(p=config.hidden_dropout_prob)
+
         self.sentiment_classifier = nn.Linear(BERT_HIDDEN_SIZE, N_SENTIMENT_CLASSES)
 
         # 添加用于释义检测的层
@@ -71,7 +70,7 @@ class MultitaskBERT(nn.Module):
         ### TODO
         outputs = self.bert(input_ids, attention_mask)
         cls_output = outputs['pooler_output']
-        cls_output = self.dropout(cls_output)
+
         return cls_output
 
 
@@ -155,11 +154,18 @@ def train_multitask(args):
 
     sst_train_data = SentenceClassificationDataset(sst_train_data, args)
     sst_dev_data = SentenceClassificationDataset(sst_dev_data, args)
+    para_train_data = SentencePairDataset(para_train_data, args)
+    para_dev_data = SentencePairDataset(para_dev_data, args)
+    sts_train_data = SentencePairDataset(sts_train_data, args)
+    sts_dev_data = SentencePairDataset(sts_dev_data, args)
 
-    sst_train_dataloader = DataLoader(sst_train_data, shuffle=True, batch_size=args.batch_size,
-                                      collate_fn=sst_train_data.collate_fn)
-    sst_dev_dataloader = DataLoader(sst_dev_data, shuffle=False, batch_size=args.batch_size,
-                                    collate_fn=sst_dev_data.collate_fn)
+    sst_train_dataloader = DataLoader(sst_train_data, shuffle=True, batch_size=args.batch_size, collate_fn=sst_train_data.collate_fn)
+    sst_dev_dataloader = DataLoader(sst_dev_data, shuffle=False, batch_size=args.batch_size, collate_fn=sst_dev_data.collate_fn)
+    para_train_dataloader = DataLoader(para_train_data, shuffle=True, batch_size=args.batch_size, collate_fn=para_train_data.collate_fn)
+    para_dev_dataloader = DataLoader(para_dev_data, shuffle=False, batch_size=args.batch_size, collate_fn=para_dev_data.collate_fn)
+    sts_train_dataloader = DataLoader(sts_train_data, shuffle=True, batch_size=args.batch_size, collate_fn=sts_train_data.collate_fn)
+    sts_dev_dataloader = DataLoader(sts_dev_data, shuffle=False, batch_size=args.batch_size, collate_fn=sts_dev_data.collate_fn)
+
 
     # Init model
     config = {'hidden_dropout_prob': args.hidden_dropout_prob,
@@ -175,7 +181,7 @@ def train_multitask(args):
         print(f"Loaded pretrained model from {args.filepath_of_pretrain}")
     else:
         model = MultitaskBERT(config)
-        optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+        optimizer = AdamW(model.parameters(), lr=args.lr)
         print(f"No pretrained model found. Initializing new model.")
 
     model = model.to(device)
@@ -197,34 +203,80 @@ def train_multitask(args):
         model.train()
         train_loss = 0
         num_batches = 0
-        for batch in tqdm(sst_train_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE):
-            b_ids, b_mask, b_labels = (batch['token_ids'],
-                                       batch['attention_mask'], batch['labels'])
+        total_loss_sst = 0
+        total_loss_para = 0
+        total_loss_sts = 0
 
-            b_ids = b_ids.to(device)
-            b_mask = b_mask.to(device)
-            b_labels = b_labels.to(device)
+        for sst_batch, para_batch, sts_batch in zip(tqdm(sst_train_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE),
+                                                    para_train_dataloader, sts_train_dataloader):
+            # Sentiment Classification Task
+            sst_ids, sst_mask, sst_labels = (sst_batch['token_ids'],
+                                             sst_batch['attention_mask'], sst_batch['labels'])
+            sst_ids = sst_ids.to(device)
+            sst_mask = sst_mask.to(device)
+            sst_labels = sst_labels.to(device)
+            logits_sst = model.predict_sentiment(sst_ids, sst_mask)
+            loss_sst = F.cross_entropy(logits_sst, sst_labels.view(-1), reduction='sum') / args.batch_size
+
+            # Paraphrase Detection Task
+            para_ids_1, para_mask_1, para_ids_2, para_mask_2, para_labels = (para_batch['token_ids_1'],
+                                                                             para_batch['attention_mask_1'],
+                                                                             para_batch['token_ids_2'],
+                                                                             para_batch['attention_mask_2'],
+                                                                             para_batch['labels'])
+            para_ids_1 = para_ids_1.to(device)
+            para_mask_1 = para_mask_1.to(device)
+            para_ids_2 = para_ids_2.to(device)
+            para_mask_2 = para_mask_2.to(device)
+            para_labels = para_labels.to(device)
+            logits_para = model.predict_paraphrase(para_ids_1, para_mask_1, para_ids_2, para_mask_2).squeeze()
+            loss_para = F.binary_cross_entropy_with_logits(logits_para, para_labels.float(), reduction='sum') / args.batch_size
+
+            # Semantic Textual Similarity Task
+            sts_ids_1, sts_mask_1, sts_ids_2, sts_mask_2, sts_labels = (sts_batch['token_ids_1'],
+                                                                        sts_batch['attention_mask_1'],
+                                                                        sts_batch['token_ids_2'],
+                                                                        sts_batch['attention_mask_2'],
+                                                                        sts_batch['labels'])
+            sts_ids_1 = sts_ids_1.to(device)
+            sts_mask_1 = sts_mask_1.to(device)
+            sts_ids_2 = sts_ids_2.to(device)
+            sts_mask_2 = sts_mask_2.to(device)
+            sts_labels = sts_labels.to(device).float()  # Convert to Float here
+            logits_sts = model.predict_similarity(sts_ids_1, sts_mask_1, sts_ids_2, sts_mask_2).squeeze()
+            loss_sts = F.mse_loss(logits_sts, sts_labels.view(-1), reduction='sum') / args.batch_size
+
+            # Combine the losses
+            total_loss = loss_sst + loss_para + loss_sts
 
             optimizer.zero_grad()
-            logits = model.predict_sentiment(b_ids, b_mask)
-            loss = F.cross_entropy(logits, b_labels.view(-1), reduction='sum') / args.batch_size
-
-            loss.backward()
+            total_loss.backward()
             optimizer.step()
 
-            train_loss += loss.item()
+            train_loss += total_loss.item()
+            total_loss_sst += loss_sst.item()
+            total_loss_para += loss_para.item()
+            total_loss_sts += loss_sts.item()
             num_batches += 1
 
-        train_loss = train_loss / (num_batches)
+        train_loss = train_loss / num_batches
+        total_loss_sst = total_loss_sst / num_batches
+        total_loss_para = total_loss_para / num_batches
+        total_loss_sts = total_loss_sts / num_batches
 
         train_acc, train_f1, *_ = model_eval_sst(sst_train_dataloader, model, device)
-        dev_acc, dev_f1, *_ = model_eval_sst(sst_dev_dataloader, model, device)
+        # Evaluate on dev set
+        paraphrase_accuracy, _, _, sentiment_accuracy, _, _, sts_corr, _, _ = model_eval_multitask(sst_dev_dataloader, para_dev_dataloader, sts_dev_dataloader, model, device)
 
-        if dev_acc > best_dev_acc:
-            best_dev_acc = dev_acc
+        if sentiment_accuracy > best_dev_acc:
+            best_dev_acc = sentiment_accuracy
             save_model(model, optimizer, args, config, args.filepath)
 
-        print(f"Epoch {epoch}: train loss :: {train_loss :.3f}, train acc :: {train_acc :.3f}, dev acc :: {dev_acc :.3f}")
+        print(f"Epoch {epoch}: train loss :: {train_loss :.3f}, "
+              f"train acc :: {train_acc :.3f}, dev acc :: {sentiment_accuracy :.3f}")
+        print(f"loss_sst :: {total_loss_sst :.3f}, loss_para :: {total_loss_para :.3f}, loss_sts :: {total_loss_sts :.3f}")
+        print(f"Paraphrase detection accuracy: {paraphrase_accuracy:.3f}")
+        print(f"Semantic Textual Similarity correlation: {sts_corr:.3f}")
 
 
 
@@ -263,7 +315,7 @@ def get_args():
     parser.add_argument("--sts_test", type=str, default="data/sts-test-student.csv")
 
     parser.add_argument("--seed", type=int, default=11711)
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--option", type=str,
                         help='pretrain: the BERT parameters are frozen; finetune: BERT parameters are updated',
                         choices=('pretrain', 'finetune'), default="finetune")
