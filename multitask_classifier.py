@@ -109,7 +109,8 @@ class MultitaskBERT(nn.Module):
         cls_output_2 = self.forward(input_ids_2, attention_mask_2)
         diff = torch.abs(cls_output_1 - cls_output_2)
         logits = self.similarity_regressor(diff)
-        return logits
+        scaled_logits = torch.sigmoid(logits) * 5
+        return scaled_logits
 
 
 
@@ -144,8 +145,87 @@ def load_model(filepath):
 
     return model, optimizer, checkpoint['args']
 
-
 def train_multitask(args):
+    device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
+    # Load data
+    # Create the data and its corresponding datasets and dataloader
+    sst_train_data, num_labels,para_train_data, sts_train_data = load_multitask_data(args.sst_train,args.para_train,args.sts_train, split ='train')
+    sst_dev_data, num_labels,para_dev_data, sts_dev_data = load_multitask_data(args.sst_dev,args.para_dev,args.sts_dev, split ='train')
+
+    sst_train_data = SentenceClassificationDataset(sst_train_data, args)
+    sst_dev_data = SentenceClassificationDataset(sst_dev_data, args)
+
+    sst_train_dataloader = DataLoader(sst_train_data, shuffle=True, batch_size=args.batch_size,
+                                      collate_fn=sst_train_data.collate_fn)
+    sst_dev_dataloader = DataLoader(sst_dev_data, shuffle=False, batch_size=args.batch_size,
+                                    collate_fn=sst_dev_data.collate_fn)
+
+    # Init model
+    config = {'hidden_dropout_prob': args.hidden_dropout_prob,
+              'num_labels': num_labels,
+              'hidden_size': 768,
+              'data_dir': '.',
+              'option': args.option}
+
+    config = SimpleNamespace(**config)
+
+    if os.path.exists(args.filepath_of_pretrain):
+        model, optimizer, loaded_args = load_model(args.filepath_of_pretrain)
+        print(f"Loaded pretrained model from {args.filepath_of_pretrain}")
+    else:
+        model = MultitaskBERT(config)
+        optimizer = AdamW(model.parameters(), lr=args.lr)
+        print(f"No pretrained model found. Initializing new model.")
+
+    model = model.to(device)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = args.lr
+    for state in optimizer.state.values():
+        for k, v in state.items():
+            if isinstance(v, torch.Tensor):
+                state[k] = v.to(device)
+
+    if args.option == 'finetune':
+        for param in model.bert.parameters():
+            param.requires_grad = True
+
+    best_dev_acc = 0
+
+    # Run for the specified number of epochs
+    for epoch in range(args.epochs):
+        model.train()
+        train_loss = 0
+        num_batches = 0
+        for batch in tqdm(sst_train_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE):
+            b_ids, b_mask, b_labels = (batch['token_ids'],
+                                       batch['attention_mask'], batch['labels'])
+
+            b_ids = b_ids.to(device)
+            b_mask = b_mask.to(device)
+            b_labels = b_labels.to(device)
+
+            optimizer.zero_grad()
+            logits = model.predict_sentiment(b_ids, b_mask)
+            loss = F.cross_entropy(logits, b_labels.view(-1), reduction='sum') / args.batch_size
+
+            loss.backward()
+            optimizer.step()
+
+            train_loss += loss.item()
+            num_batches += 1
+
+        train_loss = train_loss / (num_batches)
+
+        train_acc, train_f1, *_ = model_eval_sst(sst_train_dataloader, model, device)
+        dev_acc, dev_f1, *_ = model_eval_sst(sst_dev_dataloader, model, device)
+
+        if dev_acc > best_dev_acc:
+            best_dev_acc = dev_acc
+            save_model(model, optimizer, args, config, args.filepath)
+
+        print(f"Epoch {epoch}: train loss :: {train_loss :.3f}, train acc :: {train_acc :.3f}, dev acc :: {dev_acc :.3f}")
+
+def train_multitask_mix(args):
     device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
     # Load data
     # Create the data and its corresponding datasets and dataloader
@@ -345,5 +425,5 @@ if __name__ == "__main__":
     args = get_args()
     args.filepath = f'{args.option}-{args.epochs}-{args.lr}-multitask.pt' # save path
     seed_everything(args.seed)  # fix the seed for reproducibility
-    train_multitask(args)
+    train_multitask_mix(args)
     test_model(args)
